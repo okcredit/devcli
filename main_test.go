@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os/exec"
+	"strconv"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -27,7 +28,7 @@ func TestCheckGcloud(t *testing.T) {
 	}
 }
 
-func TestCheckDuplicateLocalPorts(t *testing.T) {
+func TestValidateLocalPorts(t *testing.T) {
 	configData := `
 environment: staging
 
@@ -75,7 +76,7 @@ proxies:
 	var config Config
 	err := yaml.Unmarshal([]byte(configData), &config)
 	if err != nil {
-		t.Fatalf("Error parsing configuration data for TestCheckDuplicateLocalPorts: %v", err)
+		t.Fatalf("Error parsing configuration data for TestValidateLocalPorts: %v", err)
 	}
 
 	// get the proxy configuration for the environment
@@ -87,7 +88,8 @@ proxies:
 		}
 	}
 
-	if checkDuplicateLocalPorts(proxyConfig) {
+	_, err = validateLocalPorts(proxyConfig)
+	if err == ErrDuplicateLocalPorts {
 		t.Error("checkDuplicateLocalPorts failed: found duplicate local ports.")
 	}
 }
@@ -116,9 +118,24 @@ func TestConnectBastion(t *testing.T) {
 
 // test for checkPortAvailable
 func TestCheckPortAvailable(t *testing.T) {
-	port := 5434
+	port := 5555
 	result := checkPortAvailable(port)
 	if !result {
 		t.Error("checkPortAvailable failed: the port is not available.")
+	}
+}
+
+// test for killProcess, killing process by port
+func TestKillProcess(t *testing.T) {
+	port := 5555
+	// create a dummy process at given port
+	cmd := exec.Command("nc", "-l", strconv.Itoa(port))
+	err := cmd.Start()
+	if err != nil {
+		t.Fatalf("Error creating dummy process: %v", err)
+	}
+	err = killProcess(port)
+	if err != nil {
+		t.Errorf("killProcess failed: %v", err)
 	}
 }

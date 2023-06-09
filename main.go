@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -51,6 +52,8 @@ type Config struct {
 	Environment string        `yaml:"environment"`
 }
 
+var ErrDuplicateLocalPorts = errors.New("duplicate_local_ports")
+
 func checkKubectl(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, "kubectl", "version", "--client")
 	if err := cmd.Run(); err != nil {
@@ -67,24 +70,32 @@ func checkGcloud(ctx context.Context) bool {
 	return true
 }
 
-func checkDuplicateLocalPorts(config ProxyConfig) bool {
+// validateLocalPorts checks if there are duplicate local ports and returns true if there are duplicate local ports
+func validateLocalPorts(config ProxyConfig) ([]int, error) {
 	localPorts := make(map[int]bool)
 
 	for _, workload := range config.Workloads {
 		if localPorts[workload.LocalPort] {
-			return true
+			fmt.Println("Error: duplicate local ports in the configuration file.", workload.LocalPort)
+			return nil, ErrDuplicateLocalPorts
 		}
 		localPorts[workload.LocalPort] = true
 	}
 
 	for _, connection := range config.Bastion.Connections {
 		if localPorts[connection.LocalPort] {
-			return true
+			fmt.Println("Error: duplicate local ports in the configuration file.", connection.LocalPort)
+			return nil, ErrDuplicateLocalPorts
 		}
 		localPorts[connection.LocalPort] = true
 	}
 
-	return false
+	// return list of local ports from localPorts map
+	var localPortsList []int
+	for localPort := range localPorts {
+		localPortsList = append(localPortsList, localPort)
+	}
+	return localPortsList, nil
 }
 
 func connectBastion(ctx context.Context, bastion Bastion, connection Connection) *exec.Cmd {
@@ -100,6 +111,44 @@ func checkPortAvailable(port int) bool {
 		return true
 	}
 	return false
+}
+
+func killProcess(port int) error {
+	fmt.Println("Killing the process using port:", port)
+	// find the pid for the port
+	portCmd := exec.Command("lsof", "-t", fmt.Sprintf("-i:%d", port))
+	out, err := portCmd.Output()
+	if err != nil {
+		return err
+	}
+	pid := strings.Replace(string(out), "\n", "", -1)
+	// kill the process using the pid
+	killCmd := exec.Command("kill", "-9", pid)
+	if err := killCmd.Run(); err != nil {
+		return err
+	}
+	fmt.Println("Successfully killed the process using port:", port)
+	return nil
+}
+
+func getPortReuseConfirmation(port int) string {
+	fmt.Printf("Error: port %d is being used by another process.\n", port)
+	fmt.Println("Do you want to kill the process using this port?")
+	fmt.Println(`Warning: If you kill this process, you will not be able to access the application running on this port.`)
+	fmt.Println("Please choose one of the action: (a/y/n/e)")
+	fmt.Println("a - kill all processes if an existing process is using ports in the configuration file")
+	fmt.Println("y - kill the process using this port")
+	fmt.Println("n - do not kill the process using this port")
+	fmt.Println("e - exit the program")
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+	input = strings.ToLower(input)
+	if input != "a" && input != "y" && input != "n" && input != "e" {
+		fmt.Println("Invalid input. retry...")
+		return getPortReuseConfirmation(port)
+	}
+	return input
 }
 
 func main() {
@@ -209,6 +258,50 @@ func main() {
 		fmt.Println("Error: proxy configuration for environment", config.Environment, "is not found.")
 		os.Exit(1)
 	}
+
+	// Check if there are duplicate local ports
+	localPorts, err := validateLocalPorts(proxyConfig)
+	if err == ErrDuplicateLocalPorts {
+		fmt.Println("Error: there are duplicate local ports in the configuration file.")
+		os.Exit(1)
+	}
+
+	var reusePorts bool
+
+	// check if the port on local machine is available
+	for _, port := range localPorts {
+		if !checkPortAvailable(port) {
+			// check if reusePorts is set to true
+			if !reusePorts {
+				// ask user if they want to reuse ports
+				input := getPortReuseConfirmation(port)
+				if input == "a" {
+					reusePorts = true
+				} else if input == "e" {
+					fmt.Println("Exiting devcli...")
+					os.Exit(1)
+				} else if input == "n" {
+					continue
+				} else if input == "y" {
+					// kill the process using the port
+					err := killProcess(port)
+					if err != nil {
+						fmt.Println("Error killing process using port:", err)
+						os.Exit(1)
+					}
+				}
+			}
+			if reusePorts {
+				// kill the process using the port
+				err := killProcess(port)
+				if err != nil {
+					fmt.Println("Error killing process using port:", err)
+					os.Exit(1)
+				}
+			}
+		}
+	}
+
 	// print when proxy configuration is found
 	fmt.Println("Setting up proxy for environment", proxyConfig.Environment)
 
@@ -261,20 +354,6 @@ func main() {
 	if gcloudProjectName == "" {
 		fmt.Println("Error: project is not set in the configuration file.")
 		os.Exit(1)
-	}
-
-	// Check if there are duplicate local ports
-	if checkDuplicateLocalPorts(proxyConfig) {
-		fmt.Println("Error: there are duplicate local ports in the configuration file.")
-		os.Exit(1)
-	}
-
-	// check if the port on local machine is available
-	for _, workload := range proxyConfig.Workloads {
-		if !checkPortAvailable(workload.LocalPort) {
-			fmt.Printf("Error: port %d is not available on local machine.\n", workload.LocalPort)
-			os.Exit(1)
-		}
 	}
 
 	// set gcloud project
@@ -345,7 +424,7 @@ func main() {
 
 	// Listen for SIGINT and SIGTERM signals
 	ch := make(chan os.Signal, 2)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 
 	// Cancel the context when the program is interrupted
 	go func() {
