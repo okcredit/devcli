@@ -35,3 +35,4 @@ bin/*
 *.vsix
 
 config.yaml
+dist/
